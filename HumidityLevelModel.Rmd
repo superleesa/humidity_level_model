@@ -1,0 +1,654 @@
+---
+title: "Humidy_level_model"
+output: html_notebook
+---
+
+# Humidity Level Model
+
+We use the data from <https://www.kaggle.com/datasets/jsphyg/weather-dataset-rattle-package>.
+
+These are all the packages used in this analysis.
+
+```{r}
+library(e1071)  # naive bayes
+library(tree) # decision tree
+library(adabag)  # bagging
+library(ROCR)  # roc, auc
+library(randomForest) # random forest
+library(neuralnet)
+library(xgboost) # xgboost (used in investigative task)
+library(glmnet)  # for lasso, feature selection
+
+library(corrplot)  # visualization of correleation
+library(coefplot)  # visualization of coefficients
+library(dplyr)  # data manipulation
+library(caret) # one-hot encoding and cross validation
+```
+
+We first sample some data from the original data for analysis.
+
+```{r}
+#rm(list = ls())
+WAUS <- read.csv("HumidPredict2023D.csv", stringsAsFactors = T)
+
+# note: the target should be factor
+WAUS["MHT"] = as.factor(WAUS$MHT)
+
+L <- as.data.frame(c(1:49))
+set.seed(32678940)
+L <- L[sample(nrow(L), 10, replace = FALSE),] # sample 10 locations
+WAUS <- WAUS[(WAUS$Location %in% L),]
+WAUS <- WAUS[sample(nrow(WAUS), 2000, replace = FALSE),] # sample 2000 rows
+```
+
+This is the sampled dataset.
+
+```{r}
+WAUS
+```
+
+```{r}
+names(WAUS)
+```
+
+Checking Correlation
+
+```{r}
+numerical_variables <- cbind(WAUS[,sapply(WAUS, class) %in% c("integer", "numeric")], as.numeric(WAUS$MHT))
+corrplot(cor(numerical_variables, use="complete.obs"), type="upper")
+```
+
+## Handling NAs
+
+We will first check the number of NAs in each feature.
+
+```{r}
+nas = apply(WAUS, 2, function(col) sum(is.na(col)))
+barplot(sort(nas), las="3")
+```
+
+for target
+
+```{r}
+countOne = sum(WAUS$MHT == 1, na.rm = TRUE)
+countZero = sum(WAUS$MHT == 0, na.rm=TRUE)
+countNA = sum(is.na(WAUS$MHT))
+barplot(c(countOne, countZero, countNA), names.arg=c("0", "1", "NA"))
+```
+
+Insights:
+
+-   there are lots of NA, particulay in Sunshine, Evaporation, Cloud3pm, and Cloud9am.
+
+-   One possible method to handle these NA values is to simply remove all the corresponding rows. However, if we look at the Sunshine column, almost half of its values are null. This implies that when we remove the corresponding rows, we would only have 1000 rows of data.
+
+-   We cannot remove Sunshine column since the it seems that it has relationship with the target, from the correlation plot.
+
+-   Therefore, we will impute these NA values.
+
+-   to avoid underfitting, for each NA value, it will be replaced by median of the corresponding column for the same location&year; if the variable is categorical, we will use the mode instead of median.
+
+-   for unknown Years, we will simply remove rows with corresponding rows.
+
+-   the target seems to have a balanced number of 0s and 1s -\> no need to oversample/undersample. However, there are about 100 rows with NA. We will just remove these columns.
+
+Before imputing NAs using mode and median, we need to split the train and test data to avoid data leakage.
+
+```{r}
+# before imputing, we will split the data into train and test data
+set.seed(32678940) #Student ID as random seed
+train_idxs = sample(1:nrow(WAUS), 0.75*nrow(WAUS))
+WAUS_train = WAUS[train_idxs,]
+WAUS_test = WAUS[-train_idxs,]
+```
+
+```{r}
+# ensure that no years and locations are null
+# remove rows wuth unknown Year
+WAUS_train <- WAUS_train[!is.na(WAUS_train$Year),]
+
+# we also removes rows with target value = NA
+WAUS_train <- WAUS_train[!is.na(WAUS_train$MHT),]
+```
+
+Now, since we compute median for numerical variables and mode for categorical variables, we need to separate the train dataframe in to numerical and categorical dataframe.
+
+```{r}
+col_data_types = sapply(WAUS_train, class)
+# separe the numerical and categorical columns
+numerical_cols = WAUS_train[col_data_types=="integer" | col_data_types=="numeric"]
+categorical_cols = WAUS_train[col_data_types=="character" | col_data_types=="factor"]
+```
+
+This function is used to compute the median of each numerical column.
+
+```{r}
+# group by locations and year
+# calculate median value for each missing value (e.g. for sunshine)
+# impute corresponding fields by that value
+overall_medians = sapply(numerical_cols, median, na.rm = T)
+
+get_median_without_na <- function(x, col_name){
+  # input x shou;d be a column vector
+  
+  # if there are only NA values in this column, just return the overall mode
+  if (length(x[!is.na(x)]) == 0){
+    return(overall_medians[col_name])
+  }
+  # if there is at least one non-NA value return the mode among them
+  return(median(x, na.rm = TRUE))
+}
+
+
+medians <- numerical_cols %>% group_by(Location, Year) %>% summarize(across(everything(), get_median_without_na, col_name = cur_column()))
+```
+
+This function is used to compute the mode for each categorical column.
+
+```{r}
+# for categorical columns, we find the mode
+get_mode <- function(x) {
+  # input x shou;d be a column vector
+  x <- x[!is.na(x)]
+  tab <- table(x)
+  mode <- names(tab)[which.max(tab)]
+  return(mode)
+}
+
+overall_modes <- sapply(categorical_cols, get_mode)
+
+
+get_mode_without_na <- function(x, col_name){
+  # input x shou;d be a column vector
+  
+  # if there are only NA values in this column, just return the overall mode
+  if (length(x[!is.na(x)]) == 0){
+    return(overall_modes[col_name])
+  }
+  # if there is at least one non-NA value return the mode among them
+  return(get_mode(x))
+}
+
+
+modes <- cbind(WAUS_train[c("Location", "Year")], categorical_cols) %>% group_by(Location, Year) %>% summarize(across(everything(), get_mode_without_na, col_name = cur_column()))
+```
+
+Now, we join the medians and modes dataframes so that we have one dataframe representing a central value for every column in the dataset.
+
+```{r}
+central_values <- left_join(medians, modes, by=c("Location"="Location", "Year" = "Year"))
+```
+
+```{r}
+central_values
+```
+
+Below function is used to ensure that if there is a pair of locatoin and year values that weren't seen in the train data, they are imputed as follow: 1) some year of the same location. 2) if 1) is not possible, some location of the same year. 3) if 2) is not posdsible, just pick a random pair of year and location in the central_values dataframe.
+
+```{r}
+get_a_random_year_and_location <- function(central_values){
+  random_row = central_values[sample(1:nrow(central_values), 1),]
+  location = random_row["Location"]
+  year = random_row["Year"]
+  
+  return(c(year, location))
+}
+
+get_year_location_pair <- function(year, location, central_values) {
+  # check if both location and year are missing
+  if (is.na(location) & is.na(year)) {
+    # pick a row randomly
+    return(get_a_random_year_and_location(central_values))
+  }
+  
+  # check if the pair exists in the central_values dataframe
+  if (!is.na(location) & !is.na(year) & nrow(central_values[central_values$Location == location & central_values$Year == year, ]) > 0) {
+    return(c(year, location))
+  }
+  
+  # check if rows with the same location exist
+  if (!is.na(location)) {
+    df_same_loc <- central_values[central_values$Location == location, ]
+    if (nrow(df_same_loc) > 0) {
+      year <- df_same_loc[sample(1:nrow(df_same_loc), 1), "Year"]
+      return(c(year, location))
+    }
+  }
+  
+  # check if rows with the same year exist
+  if (!is.na(year)) {
+    df_same_year <- central_values[central_values$Year == year, ]
+    if (nrow(df_same_year) > 0) {
+      location <- df_same_year[sample(1:nrow(df_same_year), 1), "Location"]
+      return(c(year, location))
+    }
+  }
+  
+  # pick a row randomly if no matching location or year is found
+  return(get_a_random_year_and_location(central_values))
+}
+```
+
+The main imputer function. This will be applied to both the train and test data.
+
+```{r}
+set.seed(32678940)
+
+# note: this function takes a while to run
+imputer = function(WAUS, central_values){
+  for (i in 1:nrow(WAUS)){
+     # need to ensure that Year and Location column is not NA for each row of test data  
+      year_and_location <- get_year_location_pair(WAUS[i, "Year"], WAUS[i, "Location"], central_values)
+      year_value <- year_and_location[1]
+      location_value <- year_and_location[2]
+      
+      if (!isTRUE(year_value == WAUS[i, "Year"])){
+        WAUS[i, "Year"] <- year_value
+      }
+      
+      if (!isTRUE(location_value == WAUS[i, "Location"])){
+        WAUS[i, "Location"] <- location_value
+      }
+       
+      
+    for (j in 3:ncol(WAUS)){
+    # from 3 because we ignore year and location column
+    if (is.na(WAUS[i, j])){
+      #print(paste("year value: ", year_value))
+      #print(paste("location value", location_value))
+      #print(central_values[central_values["Year"] == year_value & central_values["Location"] == location_value, names(WAUS)[j]])
+      
+      WAUS[i, j] <- central_values[central_values["Year"] == year_value & central_values["Location"] == location_value, names(WAUS)[j]]
+    }
+  }
+  }
+  return(WAUS)
+}
+```
+
+This function call takes about 10 seconds to finish on 1500 rows.
+
+```{r}
+WAUS_train <- imputer(WAUS_train, central_values)
+```
+
+## Feature Engineering
+
+-   considering some interactions
+
+```{r}
+compass_encoding <- function(direction) {
+  encoding <- case_when(
+    direction == "N" ~ 0,
+    direction == "NNE" ~ 22.5,
+    direction == "NE" ~ 45,
+    direction == "ENE" ~ 67.5,
+    direction == "E" ~ 90,
+    direction == "ESE" ~ 112.5,
+    direction == "SE" ~ 135,
+    direction == "SSE" ~ 157.5,
+    direction == "S" ~ 180,
+    direction == "SSW" ~ 202.5,
+    direction == "SW" ~ 225,
+    direction == "WSW" ~ 247.5,
+    direction == "W" ~ 270,
+    direction == "WNW" ~ 292.5,
+    direction == "NW" ~ 315,
+    direction == "NNW" ~ 337.5,
+    TRUE ~ NA_real_
+  )
+  
+  return(encoding)
+}
+
+calculate_minimum_angle <- function(angle1, angle2) {
+  diff <- abs(angle2 - angle1)
+  return(ifelse(diff>180, 360-diff, diff))
+}
+
+# puts penalty if there are more clouds in the sky, even if there is the Sun
+calculate_adjusted_brightness <- function(sunshine, cloud_fraction) {
+  total_possible_sunshine_hours <- 24  # Assuming 24 hours in a day
+
+  brightness_ratio <- sunshine / total_possible_sunshine_hours
+  adjusted_brightness <- brightness_ratio * (1 - (cloud_fraction / 8))  # Adjusted brightness considering cloud cover
+
+  return(adjusted_brightness)
+}
+```
+
+```{r}
+add_interactions <- function(df) {
+  df %>% 
+    mutate(
+      temp_dif = MaxTemp - MinTemp,
+      temp_avg = (MaxTemp+MinTemp)/2,
+      pressure_change = Pressure3pm - Pressure9am,
+      temp_change = Temp3pm - Temp9am,
+      wind_speed_change = WindSpeed3pm - WindSpeed9am,
+      cloudedness_dif = Cloud3pm - Cloud9am,
+      cloudedness_avg = (Cloud3pm + Cloud9am)/2,
+      compass_encoded_windDur9am = compass_encoding(WindDir9am),
+      compass_encoded_windDur3pm = compass_encoding(WindDir3pm)
+    ) %>% 
+    mutate(
+      wind_direction_dif = calculate_minimum_angle(compass_encoded_windDur9am, compass_encoded_windDur3pm),
+      adjusted_brightness = calculate_adjusted_brightness(Sunshine, cloudedness_avg)
+    ) %>% 
+    select(-compass_encoded_windDur9am, -compass_encoded_windDur3pm)
+}
+```
+
+```{r}
+WAUS_train <- add_interactions(WAUS_train)
+```
+
+```{r}
+WAUS_train
+```
+
+## 3. Model Training/Predicting
+
+We first apply the imputer and add same interactions as the train data.
+
+```{r}
+# applying the same transformation to the test data
+WAUS_test <- imputer(WAUS_test, central_values)
+WAUS_test <- add_interactions(WAUS_test)
+```
+
+```{r}
+WAUS_test
+```
+
+Now, we will fit decision tree, Naive Bayes, Bagging, Adaboost, Random Forest. We will analyze results of these model fitting in the subsequent section.
+
+### Fitting a decision tree model
+
+```{r}
+cms <- list()  # to store all confusion matrices
+```
+
+```{r}
+decision_tree_model <- tree(MHT~., data=WAUS_train)
+pred_decision_tree <- predict(decision_tree_model, WAUS_test, type="class")
+decision_tree_cm <- table(actual=WAUS_test$MHT, predicted=pred_decision_tree)
+cms <- c(cms, list(decision_tree_cm))
+print(decision_tree_cm)
+```
+
+We see that most branches are predicted as 0. Only if Temp9am \>= 22.15 and temp_dif \>= 7.2 will the model predict tomorrow is more humid.
+
+```{r}
+plot(decision_tree_model)
+text(decision_tree_model)
+```
+
+### Fitting a Naive Bayes Model
+
+```{r}
+naive_bayes_model <- naiveBayes(MHT~., data=WAUS_train)
+pred_naive_bayes <- predict(naive_bayes_model, WAUS_test)
+naive_bayes_cm <- table(actual=WAUS_test$MHT, predicted=pred_naive_bayes)
+
+cms <- c(cms, list(naive_bayes_cm))
+print(naive_bayes_cm)
+```
+
+### Fitting a Bagging model
+
+```{r}
+bagging_model <- bagging(MHT~., data=WAUS_train)
+pred_bagging <- predict.bagging(bagging_model, WAUS_test)
+bagging_cm <- table(actual=WAUS_test$MHT, predicted=apply(pred_bagging$prob, 1, which.max) - 1)
+cms <- c(cms, list(bagging_cm))
+print(bagging_cm)
+```
+
+### Fitting a Boosting model
+
+```{r}
+boosting_model <- boosting(MHT~., data=WAUS_train)
+pred_boosting <- predict.boosting(boosting_model, WAUS_test)
+boosting_cm <- table(actual=WAUS_test$MHT, predicted=apply(pred_boosting$prob, 1, which.max) - 1)
+
+cms <- c(cms, list(boosting_cm))
+print(boosting_cm)
+```
+
+### Fitting a Random Forest model
+
+```{r}
+rf_model <- randomForest(MHT~.,data=WAUS_train)
+pred_rf <- predict(rf_model, WAUS_test)
+rf_cm <- table(actual=WAUS_test$MHT, predicted=pred_rf)
+cms <- c(cms, list(rf_cm))
+print(rf_cm)
+```
+
+## 4. Model Comparison (Question 5\~7)
+
+To compare the performances of models, we will create ROC graph and calculate AUCs.
+
+```{r}
+# creating ROC diagram
+
+# for decision tree
+decision_tree_cpred <- ROCR::prediction(predict(decision_tree_model, WAUS_test, type="vector")[,2], WAUS_test$MHT)
+decision_tree_roc <- performance(decision_tree_cpred, "tpr", "fpr")
+plot(decision_tree_roc, col="red")
+abline(0,1)
+
+# for naive bayes
+naive_bayes_cpred <- ROCR::prediction(predict(naive_bayes_model, WAUS_test, type="raw")[,2], WAUS_test$MHT)
+naive_bayes_roc <- performance(naive_bayes_cpred, "tpr", "fpr")
+plot(naive_bayes_roc, add=TRUE, col="blueviolet")
+
+# for bagging
+bagging_cpred <- ROCR::prediction(pred_bagging$prob[,2], WAUS_test$MHT)
+bagging_roc <- performance(bagging_cpred, "tpr", "fpr")
+plot(bagging_roc, add=TRUE, col="blue")
+
+# for boosting
+boosting_cpred <- ROCR::prediction(pred_boosting$prob[,2], WAUS_test$MHT)
+boosting_roc <- performance(boosting_cpred, "tpr", "fpr")
+plot(boosting_roc, add=TRUE, col="orange")
+
+# for random forest
+rf_cpred <- ROCR::prediction(predict(rf_model,WAUS_test, type="prob")[,2], WAUS_test$MHT)
+rf_roc <- performance(rf_cpred, "tpr", "fpr")
+plot(rf_roc, add=TRUE, col="darkgreen")
+
+legend("bottomright", legend = c("Standard Decision Tree", "Naive Bayes", "Bagging", "Boosting", "Random Forest"), col = c("red", "blueviolet", "blue", "orange", "darkgreen"), lwd=1)
+```
+
+We compute the AUC for each ROC curves obtained above.
+
+```{r}
+# calculate AUC
+cpreds <- list(decision_tree_cpred,
+           naive_bayes_cpred,
+           bagging_cpred,
+           boosting_cpred,
+           rf_cpred)
+model_names <- c("Standard Decision Tree", "Naive Bayes", "Bagging", "Boosting", "Random Forest")
+
+aucs <- c()
+
+print("AUC values:")
+for (i in 1:length(cpreds)){
+  model_cpred <- cpreds[[i]]
+  model_name <- model_names[i]
+  auc <- performance(model_cpred, "auc")@y.values[[1]]
+  aucs <- c(aucs, auc)
+  print(paste(model_name, ":  ", auc))
+}
+
+```
+
+Now we summarize the accuracy and AUC of all models we created into a dataframe.
+
+```{r}
+# calculaing accuracy
+accs = c()
+recalls = c()
+precisions = c()
+for (i in 1:length(cms)){
+  cm <- cms[[i]]
+  a <- sum(cm[1,1]+cm[2,2])/sum(cm)
+  r <- cm[1,1]/sum(cm[1,])
+  p <- cm[1, 1]/sum(cm[,1])
+  
+  accs <- c(accs, a)
+  recalls <- c(recalls, r)
+  precisions <- c(precisions, p)
+}
+
+
+metrics <- data.frame(Accuracy=accs, AUC=aucs, Recall=recalls, Precision=precisions)
+rownames(metrics) <- model_names
+print(metrics)
+```
+
+Insights:
+
+-   Looking at the ROC graph, the random forest model constant;y upperbounds other models.
+
+-   This is also reflected in the AUC value of 0.649 (note: this value can change due to random variable selection with RF), which is the largest of all the models we have created.
+
+-   Compared to other models, we can argue that the Random Forest algorithm is the best model, which makes sense because it is an ensemble model and can fit to more complex data patterns.
+
+-   Oppositely, Naive Bayes has the lowest accuracy and AUC. Visually too, it is almost always performing worst for different confidence levels.
+
+## 
+
+# Hyperparameter Tuning / Further Analysis
+
+We'll take a look at the variable importance of each tree-based model.
+
+Variable Importance for Random Forest
+
+```{r}
+
+# for random forest
+print("Random Forest")
+sort(rf_model$importance[,1], decreasing = TRUE)
+varImpPlot(rf_model,sort = T,n.var = 20, main = "Top 20 Variable Importance")
+```
+
+Variable Importance for Boosting
+
+```{r}
+sort(boosting_model$importance, decreasing = TRUE)
+```
+
+Variable importance for bagging
+
+```{r}
+sort(bagging_model$importance, decreasing = TRUE)
+```
+
+Insights:
+
+-   some attributes that are constantly ranked in top-10 varaible importances are: WindDir3pm, WindDir9am, WindGustDir, Temp9am, temp_dif, Evaporation, temp_change, pressure_change
+
+-   oppositely, some attributes that are constantly ranked in worst-10 VIs are: wind_direction_dif, RainToday, Cloud3pm, RISK_MM, Cloud9pm, Location, Year, cloudedness_dif, WindSpeed9am
+
+-   We should remove these variables since they might cause unwanted variance in the model. Later, we will also refer to Lasso and figure out which variablesto omit.
+
+-   Note: the fact that location and year are not significant predictors imply that the original approach taken to impute the NAs (where I grouped rows by location and year and them calculated its median/mode) might have been not so effective. In the future, I can choose more dominant variables to group by and aggregate, or simply calculate mean/median for each column.
+
+Notable hyperparameters of RF are mtry (which is the number of variables to try splitting at each node) and ntree (which is the number of trees). Here, using gridsearch from caret package, I will find the optimum mtry value. (Note that in many cases post-pruning is not required for RF because it has multiple trees that reduces overfitting problem).
+
+Note: this cell takes about 10 mins to run. This code just finds the optimal mtry value so can skip.
+
+```{r}
+control <- trainControl(method='repeatedcv', 
+                        number=10, 
+                        repeats=3,
+                        search='grid',
+                        verbose=TRUE)
+
+param_grid <- expand.grid(.mtry=1:6)
+rf_grid_search <- train(MHT~., 
+                      data=WAUS_train, 
+                      method='rf', 
+                      metric="Accuracy", 
+                      tuneGrid=param_grid, 
+                      trControl=control)
+print(rf_grid_search)
+```
+
+From the above, we see that mtry=4 is the most optimum value. Therefore, we will fit another RF using this mtry value.
+
+```{r}
+rf2_model <- randomForest(MHT~.,data=WAUS_train, mtry=4)
+pred_rf2 <- predict(rf2_model, WAUS_test)
+rf2_cm <- table(actual=WAUS_test$MHT, predicted=pred_rf2)
+print(rf2_cm)
+```
+
+Now, we will compute AUC and accuracy to compare this model with the previous ones.
+
+```{r}
+rf2_cpred <- ROCR::prediction(predict(rf2_model,WAUS_test, type="prob")[,2], WAUS_test$MHT)
+rf2_auc <- performance(rf2_cpred, "auc")@y.values[[1]]
+print(rf2_auc)
+```
+
+Now, we will fit Lasso model as well, to select features. We use glmnet package to do this. We first one-hot encode all categorical variables using caret. We then apply cross validation to obtain the optimal value of lambda i.e. the hyperparameter for penalty magnitude. Finally, we apply the Lasso using the optimal lambda to find variables that are considered as insignificant.
+
+```{r}
+
+factor_cols <- sapply(WAUS_train, is.factor)
+ohe <- dummyVars(~.,data = WAUS_train[, factor_cols])  # fit
+WAUS_train_encoded <- predict(ohe, newdata = WAUS_train)  # trainsform train data
+WAUS_train_encoded <- cbind(WAUS_train_encoded, WAUS_train[,!factor_cols])
+
+
+WAUS_train_X_lasso <- scale(WAUS_train_encoded[,!colnames(WAUS_train_encoded) %in% c("MHT.0", "MHT.1")])
+
+cv_result <- cv.glmnet(WAUS_train_X_lasso, WAUS_train$MHT, family = "binomial", alpha = 1)  # to find the optimal lambda i.e. the penalty
+optimal_lambda <- cv_result$lambda.min
+lasso_model_optimal <- glmnet(WAUS_train_X_lasso, WAUS_train$MHT, family = "binomial", alpha = 1, lambda = optimal_lambda)
+
+coefplot(lasso_model_optimal, main = "Lasso Logistic Regression Coefficients")
+```
+
+Insights:
+
+-   variables that are omitted by Lasso are: MinTemp, Pressure3pm, Cloud3pm, temp_dif, temp_change, wind_speed_change, wind_speed_change, cloudedness_dif, adjusted_brightness, as well as some Wind Direction related variables
+
+-   although these variables are not omitted by Lasso, these seem insignificant: Year, wind_direction_dif
+
+-   variables with high coefficient magnitudes are: RainToday.No, MaxTemp, Pressure9am, Temp9am, Temp3pm, temp_avg, WindGustSpeed, RISM_MM, Cloud9am, and WIndDir variables
+
+-   Compared with the important varaibles from the tree models:
+
+    -   Overlapped least significant features are: Cloud3pm, cloudedness_dif, Year, wind_direction_dif
+
+    -   Overlapped most significant values are: Temp9am, WindGustSpeed, WindDir
+
+-   In summary, wind direction, wind gust speed, and temperature related attributes more important. Cloud related variables seem less important. Year and wind_direction_diff variables are also insignificant.
+
+To avoid variance, we will remove the overlapping least significant features: Cloud3pm, cloudedness_dif, Year, wind_direction_dif.
+
+```{r}
+WAUS_train_selected <- WAUS_train[, !colnames(WAUS_train) %in% c("Cloud3pm", "cloudedness_dif", "Year", "wind_direction_dif")]
+WAUS_test_selected <- WAUS_test[, !colnames(WAUS_test) %in% c("Cloud3pm", "cloudedness_dif", "Year", "wind_direction_dif")]
+
+rf3_model <- randomForest(MHT~.,data=WAUS_train_selected, mtry=4)
+pred_rf3 <- predict(rf3_model, WAUS_test_selected)
+rf3_cm <- table(actual=WAUS_test_selected$MHT, predicted=pred_rf3)
+print(rf3_cm)
+```
+
+Now we calculate the accuracy and AUC for this model.
+
+```{r}
+rf3_cpred <- ROCR::prediction(predict(rf3_model,WAUS_test_selected, type="prob")[,2], WAUS_test_selected$MHT)
+rf3_auc <- performance(rf3_cpred, "auc")@y.values[[1]]
+print(rf3_auc)
+```
+
+We see that AUC actually decreases from the previous model by \~=0.002 (due to change with different seed). However, this is tolerable given that this is a simpler model.
